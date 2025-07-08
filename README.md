@@ -1,4 +1,12 @@
-# airflowAIML
+## 🔄 LLM Fine-tuning Pipeline Workflow
+
+The DAG `llm_finetune_pipeline` implements modern LLM fine-tuning techniques:
+
+1. **Download Base LLM**: Downloads pre-trained language model from HuggingFace
+2. **Prepare Instruction Dataset**: Creates instruction-following dataset format
+3. **Setup LoRA Configuration**: Configures Low-Rank Adaptation parameters
+4. **LoRA# ML Model Fine-tuning Pipeline with Apache Airflow
+
 A complete MLOps pipeline that downloads a model from HuggingFace, fine-tunes it, validates the results, and uploads the improved model back to HuggingFace with manual approval gates.
 
 ## 🏗️ Architecture Overview
@@ -316,4 +324,8 @@ docker-compose up -d
 
 ## 📄 License
 
-This project is licensed under the Apache-2.0 license - see LICENSE file for details.
+This project is licensed under the MIT License - see LICENSE file for details.
+
+---
+
+**Happy ML Engineering! 🚀**
