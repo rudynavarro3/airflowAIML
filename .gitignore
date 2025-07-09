@@ -1,0 +1,9 @@
+logs/
+data/ 
+models/
+**/*.pyc
+**/__pycache__/
+**/__pycache__/**
+**/__init__.py
+**/*.log
+.env
