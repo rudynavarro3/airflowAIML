@@ -378,102 +378,319 @@ def validate_model_generation(**context):
         raise
 
 def quality_gate(**context):
-    """Check if model passes quality gates"""
+    """Robust quality gate with real metrics and decision logic"""
     try:
         results_path = '/opt/airflow/models/validation_results.json'
+        
+        if not os.path.exists(results_path):
+            logging.error("❌ Validation results not found!")
+            raise FileNotFoundError("Validation results required for quality gate")
         
         with open(results_path, 'r') as f:
             results = json.load(f)
         
         summary = results['summary']
+        test_cases = results['test_cases']
         
-        # Quality thresholds
-        min_success_rate = 0.6  # 60%
-        min_quality_score = 0.5  # 0.5/1.0
-        min_avg_length = 1.0   # 1 word average
+        # Enhanced quality thresholds
+        quality_criteria = {
+            'min_success_rate': 0.8,      # 80% of generations must succeed
+            'min_quality_score': 0.6,     # Average quality score >= 0.6
+            'min_avg_length': 2.0,        # Average response >= 2 words
+            'max_avg_length': 50.0,       # Average response <= 50 words (not too verbose)
+            'min_coherent_responses': 3,   # At least 3 coherent responses
+            'max_error_rate': 0.2         # No more than 20% errors
+        }
         
+        # Calculate detailed metrics
         success_rate = summary['success_rate']
         quality_score = summary['avg_quality_score']
         avg_length = summary['avg_response_length']
         
-        logging.info("🎯 Quality Gate Assessment:")
-        logging.info(f"  • Success Rate: {success_rate:.2%} (min: {min_success_rate:.2%})")
-        logging.info(f"  • Quality Score: {quality_score:.2f} (min: {min_quality_score:.2f})")
-        logging.info(f"  • Avg Length: {avg_length:.1f} words (min: {min_avg_length})")
+        # Additional metrics from test cases
+        coherent_count = sum(1 for tc in test_cases if tc.get('is_coherent', False))
+        error_count = sum(1 for tc in test_cases if 'error' in tc)
+        error_rate = error_count / len(test_cases)
         
-        passes_quality = (
-            success_rate >= min_success_rate and
-            quality_score >= min_quality_score and
-            avg_length >= min_avg_length
-        )
+        # Response length distribution
+        lengths = [tc.get('word_count', 0) for tc in test_cases if 'word_count' in tc]
+        min_length = min(lengths) if lengths else 0
+        max_length = max(lengths) if lengths else 0
         
-        if passes_quality:
-            logging.info("✅ Model PASSES quality gates!")
+        # Quality gate evaluation
+        checks = {
+            'success_rate_check': success_rate >= quality_criteria['min_success_rate'],
+            'quality_score_check': quality_score >= quality_criteria['min_quality_score'],
+            'min_length_check': avg_length >= quality_criteria['min_avg_length'],
+            'max_length_check': avg_length <= quality_criteria['max_avg_length'],
+            'coherence_check': coherent_count >= quality_criteria['min_coherent_responses'],
+            'error_rate_check': error_rate <= quality_criteria['max_error_rate']
+        }
+        
+        passed_checks = sum(checks.values())
+        total_checks = len(checks)
+        overall_pass = passed_checks >= total_checks  # All checks must pass
+        
+        # Create detailed quality report
+        quality_report = {
+            'timestamp': datetime.now().isoformat(),
+            'overall_pass': overall_pass,
+            'checks_passed': f"{passed_checks}/{total_checks}",
+            'criteria': quality_criteria,
+            'measured_metrics': {
+                'success_rate': success_rate,
+                'quality_score': quality_score,
+                'avg_length': avg_length,
+                'coherent_responses': coherent_count,
+                'error_rate': error_rate,
+                'length_range': f"{min_length}-{max_length} words"
+            },
+            'individual_checks': checks,
+            'recommendation': 'APPROVED' if overall_pass else 'REJECTED'
+        }
+        
+        # Log detailed results
+        logging.info("🎯 QUALITY GATE ASSESSMENT")
+        logging.info("=" * 50)
+        
+        for check_name, passed in checks.items():
+            status = "✅ PASS" if passed else "❌ FAIL"
+            logging.info(f"{status} {check_name}")
+        
+        logging.info("=" * 50)
+        logging.info(f"📊 DETAILED METRICS:")
+        logging.info(f"  • Success Rate: {success_rate:.2%} (min: {quality_criteria['min_success_rate']:.2%})")
+        logging.info(f"  • Quality Score: {quality_score:.2f} (min: {quality_criteria['min_quality_score']:.2f})")
+        logging.info(f"  • Avg Length: {avg_length:.1f} words (range: {quality_criteria['min_avg_length']}-{quality_criteria['max_avg_length']})")
+        logging.info(f"  • Coherent Responses: {coherent_count} (min: {quality_criteria['min_coherent_responses']})")
+        logging.info(f"  • Error Rate: {error_rate:.2%} (max: {quality_criteria['max_error_rate']:.2%})")
+        
+        logging.info("=" * 50)
+        
+        if overall_pass:
+            logging.info("🎉 QUALITY GATE: ✅ APPROVED")
+            logging.info("Model meets all quality criteria and is ready for deployment!")
         else:
-            logging.warning("❌ Model FAILS quality gates!")
+            logging.warning("🚫 QUALITY GATE: ❌ REJECTED")
+            logging.warning("Model failed quality criteria. Review and retrain before deployment.")
+            logging.warning(f"Failed checks: {[k for k, v in checks.items() if not v]}")
         
-        return passes_quality
+        # Save quality report
+        report_path = '/opt/airflow/models/quality_report.json'
+        with open(report_path, 'w') as f:
+            json.dump(quality_report, f, indent=2)
+        
+        return overall_pass
         
     except Exception as e:
         logging.error(f"❌ Quality gate check failed: {str(e)}")
+        # Fail safe - reject if quality gate can't run
         return False
 
 def approval_and_upload(**context):
-    """Manual approval and mock upload"""
+    """Manual approval gate and real HuggingFace upload"""
+    from huggingface_hub import HfApi, login, create_repo
+    import shutil
+    
+    # Get quality gate result
+    quality_passed = context['task_instance'].xcom_pull(task_ids='quality_gate')
+    
+    logging.info("🔍 APPROVAL GATE")
+    logging.info("=" * 40)
+    
+    # Load quality report for decision making
+    report_path = '/opt/airflow/models/quality_report.json'
+    if os.path.exists(report_path):
+        with open(report_path, 'r') as f:
+            quality_report = json.load(f)
+        
+        logging.info("📋 Quality Report Summary:")
+        metrics = quality_report['measured_metrics']
+        logging.info(f"  • Success Rate: {metrics['success_rate']:.2%}")
+        logging.info(f"  • Quality Score: {metrics['quality_score']:.2f}")
+        logging.info(f"  • Coherent Responses: {metrics['coherent_responses']}")
+        logging.info(f"  • Recommendation: {quality_report['recommendation']}")
+    
+    # Manual approval logic
+    if not quality_passed:
+        logging.warning("⚠️ Model failed automated quality gates")
+        logging.info("Manual review required before deployment")
+        
+        # In production, you would:
+        # 1. Send notification to team
+        # 2. Wait for human approval
+        # 3. Check approval status
+        
+        # For demo, we'll simulate manual override
+        logging.info("🤖 Simulating manual review process...")
+        logging.info("In production: human reviewer would assess model manually")
+        
+        manual_override = False  # Set to True to override quality gate
+        
+        if not manual_override:
+            logging.error("❌ Model rejected - both automated and manual approval failed")
+            raise Exception("Model deployment rejected by quality gates and manual review")
+    
+    logging.info("✅ Model approved for deployment!")
+    
+    # Real HuggingFace upload
+    hf_token = os.getenv('HUGGINGFACE_TOKEN')
+    model_name = os.getenv('FINE_TUNED_MODEL_NAME', 'rudynavarro3/simple-demo')
+    
+    if not hf_token:
+        logging.warning("⚠️ No HUGGINGFACE_TOKEN found in environment")
+
+    logging.info("🚀 REAL HUGGINGFACE UPLOAD")
+    logging.info("=" * 40)
+    
+    # try:
+    # Login to HuggingFace
+    login(token=hf_token)
+    api = HfApi()
+    
+    logging.info(f"📤 Uploading to: {model_name}")
+    
+    # Create upload directory with model files
+    upload_dir = '/opt/airflow/models/upload_package'
+    os.makedirs(upload_dir, exist_ok=True)
+    
+    # Copy model files
+    base_model_path = '/opt/airflow/models/base_model'
+    if os.path.exists(base_model_path):
+        # Copy tokenizer files
+        for file in os.listdir(base_model_path):
+            if file.endswith(('.json', '.txt')):
+                shutil.copy2(os.path.join(base_model_path, file), upload_dir)
+                logging.info(f"  ✅ Copied {file}")
+    
+    # Create model card
+    model_card_content = f"""
+    ---
+    library_name: transformers
+    license: mit
+    base_model: {MODEL_NAME}
+    tags:
+    - text-generation
+    - fine-tuned
+    - airflow-pipeline
+    pipeline_tag: text-generation
+    ---
+
+    # Fine-tuned Model via Airflow Pipeline
+
+    This model was fine-tuned using an Apache Airflow ML pipeline.
+
+    ## Base Model
+    - **Base**: {MODEL_NAME}
+    - **Fine-tuning method**: Standard fine-tuning
+    - **Training framework**: HuggingFace Transformers
+
+    ## Quality Metrics
+    """
+    
+    if os.path.exists(report_path):
+        with open(report_path, 'r') as f:
+            quality_report = json.load(f)
+        metrics = quality_report['measured_metrics']
+        
+        model_card_content += f"""
+        - **Success Rate**: {metrics['success_rate']:.2%}
+        - **Quality Score**: {metrics['quality_score']:.2f}
+        - **Average Response Length**: {metrics['avg_length']:.1f} words
+        - **Coherent Responses**: {metrics['coherent_responses']}
+        - **Quality Gate**: {'✅ PASSED' if quality_passed else '❌ FAILED'}
+
+        ## Usage
+
+        ```python
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+
+        tokenizer = AutoTokenizer.from_pretrained("{model_name}")
+        model = AutoModelForCausalLM.from_pretrained("{model_name}")
+
+        # Generate text
+        input_text = "Hello"
+        inputs = tokenizer.encode(input_text, return_tensors="pt")
+        outputs = model.generate(inputs, max_length=50)
+        result = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        print(result)
+        ```
+
+        ## Training Details
+
+        This model was trained using an automated Airflow pipeline with:
+        - Automated quality gates
+        - Manual approval process
+        - Comprehensive validation metrics
+
+        Generated on: {datetime.now().isoformat()}
+        """
+                    
+    # Save model card
+    readme_path = os.path.join(upload_dir, 'README.md')
+    with open(readme_path, 'w') as f:
+        f.write(model_card_content)
+    
+    logging.info("  ✅ Created model card")
+    
+    # Create repository
     try:
-        # Check quality gate result
-        quality_passed = context['task_instance'].xcom_pull(task_ids='quality_gate')
-        
-        if not quality_passed:
-            logging.warning("⚠️ Model failed quality gates - requiring manual review")
-        
-        logging.info("⏳ Manual Approval Process:")
-        logging.info("  • Model validation completed")
-        logging.info("  • Quality metrics calculated")
-        logging.info("  • Ready for human review")
-        
-        # Simulate approval (in production, this would wait for human input)
-        approval_data = {
-            'timestamp': datetime.now().isoformat(),
-            'quality_gate_passed': quality_passed,
-            'approved_by': 'demo-system',
-            'approval_reason': 'automated_demo'
-        }
-        
-        # Mock upload process
-        model_name = os.getenv('FINE_TUNED_MODEL_NAME', 'demo/simple-model-v1')
-        
-        logging.info("🚀 Mock Upload Process:")
-        logging.info(f"  • Target repository: {model_name}")
-        logging.info("  • Upload steps:")
-        logging.info("    1. ✅ Validate model files")
-        logging.info("    2. ✅ Create model card")
-        logging.info("    3. ✅ Upload to HuggingFace Hub")
-        logging.info("    4. ✅ Set model visibility")
-        logging.info("    5. ✅ Add model tags")
-        
-        upload_info = {
-            **approval_data,
-            'model_repository': model_name,
-            'upload_url': f"https://huggingface.co/{model_name}",
-            'upload_status': 'mock_completed',
-            'model_size_mb': 82.5,  # Mock size for DistilGPT2
-            'upload_time_seconds': 45
-        }
-        
-        # Save upload info
-        upload_path = '/opt/airflow/models/upload_info.json'
-        with open(upload_path, 'w') as f:
-            json.dump(upload_info, f, indent=2)
-        
-        logging.info(f"✅ Mock upload completed!")
-        logging.info(f"🔗 Model available at: {upload_info['upload_url']}")
-        
-        return upload_info
-        
+        create_repo(model_name, repo_type="model", exist_ok=True)
+        logging.info(f"  ✅ Repository created/verified: {model_name}")
     except Exception as e:
-        logging.error(f"❌ Error in approval/upload: {str(e)}")
-        raise
+        logging.warning(f"  ⚠️ Repository creation warning: {e}")
+    
+    # Upload files
+    logging.info("  📤 Uploading files...")
+    
+    uploaded_files = []
+    for file in os.listdir(upload_dir):
+        file_path = os.path.join(upload_dir, file)
+        
+        try:
+            api.upload_file(
+                path_or_fileobj=file_path,
+                path_in_repo=file,
+                repo_id=model_name,
+                repo_type="model"
+            )
+            uploaded_files.append(file)
+            logging.info(f"    ✅ Uploaded: {file}")
+            
+        except Exception as e:
+            logging.error(f"    ❌ Failed to upload {file}: {e}")
+    
+    if not uploaded_files:
+        raise Exception("No files were successfully uploaded")
+    
+    # Update repository metadata
+    try:
+        api.update_repo_visibility(model_name, private=False)
+        logging.info("  ✅ Set repository to public")
+    except Exception as e:
+        logging.warning(f"  ⚠️ Could not update visibility: {e}")
+    
+    upload_info = {
+        'timestamp': datetime.now().isoformat(),
+        'model_repository': model_name,
+        'upload_url': f"https://huggingface.co/{model_name}",
+        'upload_status': 'completed',
+        'uploaded_files': uploaded_files,
+        'quality_gate_passed': quality_passed,
+        'base_model': MODEL_NAME
+    }
+    
+    logging.info("🎉 UPLOAD COMPLETED SUCCESSFULLY!")
+    logging.info(f"🔗 Model URL: https://huggingface.co/{model_name}")
+    logging.info(f"📄 Uploaded files: {', '.join(uploaded_files)}")
+    
+    # Clean up upload directory
+    shutil.rmtree(upload_dir)
+    
+    return upload_info
+        
+    # except Exception as upload_error:
+    #     logging.error(f"❌ Upload failed: {upload_error}")
 
 def cleanup_files(**context):
     """Clean up temporary files"""
@@ -549,8 +766,16 @@ cleanup_task = PythonOperator(
     dag=dag
 )
 
-end_task = DummyOperator(task_id='end_pipeline', dag=dag)
+
 
 # Define dependencies
-start_task >> download_task >> dataset_task >> training_task >> validation_task >> quality_task >> approval_task >> end_task
-approval_task >> cleanup_task
+(
+    start_task 
+    >> download_task 
+    >> dataset_task 
+    >> training_task 
+    >> validation_task 
+    >> quality_task 
+    >> approval_task
+    >> cleanup_task
+)
